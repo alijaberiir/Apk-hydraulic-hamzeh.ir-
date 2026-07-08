@@ -1,0 +1,28 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer Ring -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M 54,22 A 32,32 0 1,1 53.9,22 Z" />
+    
+    <!-- Stylized "H" Logo Inner elements -->
+    <!-- Left vertical bar (shifted up) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,34 h8 v24 h-8 z" />
+    
+    <!-- Right vertical bar (shifted down) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M60,50 h8 v24 h-8 z" />
+    
+    <!-- Center connecting crossbar -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M48,42 L60,54 L60,61 L48,49 z" />
+</vector>
