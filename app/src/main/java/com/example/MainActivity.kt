@@ -18,9 +18,15 @@ import android.telephony.SmsMessage
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import okhttp3.OkHttpClient
+import okhttp3.Cache
+import okhttp3.Request
+import okhttp3.Headers
+import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -182,6 +188,18 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // Pre-create WebView cache directories to prevent Chromium opendir errors/warnings
+        try {
+            val codeCacheDir = java.io.File(cacheDir, "WebView/Default/HTTP Cache/Code Cache")
+            if (!codeCacheDir.exists()) {
+                codeCacheDir.mkdirs()
+            }
+            java.io.File(codeCacheDir, "js").mkdirs()
+            java.io.File(codeCacheDir, "wasm").mkdirs()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
         // Safely register SMS Receiver for OTP capture with RECEIVER_EXPORTED on API 34+
         val filter = IntentFilter("android.provider.Telephony.Sms.Intents.SMS_RECEIVED_ACTION")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -241,10 +259,6 @@ fun MainScreen(
     var isLoading by remember { mutableStateOf(true) }
     var loadProgress by remember { mutableFloatStateOf(0f) }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
-    
-    // Gestures Tracking
-    var horizontalDrag by remember { mutableFloatStateOf(0f) }
-    var verticalDrag by remember { mutableFloatStateOf(0f) }
 
     // Startup Permissions Request State
     var showPermissionRationale by remember { mutableStateOf(false) }
@@ -313,44 +327,26 @@ fun MainScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                // High performance custom gesture handler for back, reload, and navigation
-                .pointerInput(webViewInstance) {
-                    detectDragGestures(
-                        onDragEnd = {
-                            // 1. Swipe Right (left-to-right gesture) -> WebView back
-                            if (horizontalDrag > 120f) {
-                                if (webViewInstance?.canGoBack() == true) {
-                                    webViewInstance?.goBack()
-                                }
-                            }
-                            // 2. Swipe Left (right-to-left gesture) -> WebView forward
-                            else if (horizontalDrag < -120f) {
-                                if (webViewInstance?.canGoForward() == true) {
-                                    webViewInstance?.goForward()
-                                }
-                            }
-                            
-                            // 3. Swipe Down (top-to-bottom gesture) -> Refresh page
-                            if (verticalDrag > 180f && webViewInstance?.scrollY == 0) {
-                                webViewInstance?.reload()
-                            }
-
-                            horizontalDrag = 0f
-                            verticalDrag = 0f
-                        },
-                        onDrag = { change, dragAmount ->
-                            change.consume()
-                            horizontalDrag += dragAmount.x
-                            verticalDrag += dragAmount.y
-                        }
-                    )
-                }
         ) {
             if (isOnline) {
-                // Optimized WebView container
+                // Optimized SwipeRefreshLayout wrapping native WebView
                 AndroidView(
                     factory = { ctx ->
-                        WebView(ctx).apply {
+                        var webViewRef: WebView? = null
+
+                        val swipeRefreshLayout = object : androidx.swiperefreshlayout.widget.SwipeRefreshLayout(ctx) {
+                            override fun canChildScrollUp(): Boolean {
+                                return webViewRef?.canScrollVertically(-1) == true
+                            }
+                        }.apply {
+                            // Match the app's premium deep-blue design palette
+                            setColorSchemeColors(
+                                android.graphics.Color.parseColor("#001C55"),
+                                android.graphics.Color.parseColor("#0050FF")
+                            )
+                        }
+
+                        val webView = WebView(ctx).apply {
                             settings.apply {
                                 javaScriptEnabled = true
                                 domStorageEnabled = true
@@ -364,19 +360,21 @@ fun MainScreen(
                                 setSupportZoom(true)
                             }
                             
-                            // Disable scrollbars completely as requested
+                            // Hide scrollbars as requested
                             isVerticalScrollBarEnabled = false
                             isHorizontalScrollBarEnabled = false
-                            
-                            webViewClient = object : WebViewClient() {
+                            isNestedScrollingEnabled = true
+                                                        webViewClient = object : WebViewClient() {
                                 override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                                     isLoading = true
                                     loadProgress = 0f
+                                    swipeRefreshLayout.isRefreshing = true
                                 }
 
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     isLoading = false
                                     loadProgress = 1f
+                                    swipeRefreshLayout.isRefreshing = false
                                 }
 
                                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -386,6 +384,66 @@ fun MainScreen(
                                 @Deprecated("Deprecated in Java")
                                 override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean {
                                     return handleUrlRedirects(ctx, url)
+                                }
+
+                                override fun shouldInterceptRequest(
+                                    view: WebView?,
+                                    request: WebResourceRequest?
+                                ): WebResourceResponse? {
+                                    if (request == null) return null
+                                    val url = request.url.toString()
+                                    
+                                    // Only intercept GET requests for static assets on HTTP/HTTPS
+                                    if (request.method.equals("GET", ignoreCase = true) &&
+                                        (url.startsWith("http://") || url.startsWith("https://")) &&
+                                        WebViewCacheManager.isStaticAsset(url)
+                                    ) {
+                                        try {
+                                            val client = WebViewCacheManager.getOkHttpClient(ctx)
+                                            val headersBuilder = okhttp3.Headers.Builder()
+                                            for ((key, value) in request.requestHeaders) {
+                                                try {
+                                                    headersBuilder.add(key, value)
+                                                } catch (e: Exception) {
+                                                    // Ignore invalid headers
+                                                }
+                                            }
+                                            
+                                            val okhttpRequest = okhttp3.Request.Builder()
+                                                .url(url)
+                                                .headers(headersBuilder.build())
+                                                .build()
+                                                
+                                            val response = client.newCall(okhttpRequest).execute()
+                                            val responseBody = response.body
+                                            if (responseBody != null) {
+                                                val contentTypeHeader = response.header("Content-Type", "application/octet-stream")
+                                                val mimeType = contentTypeHeader?.split(";")?.get(0)?.trim() ?: "application/octet-stream"
+                                                val encoding = if (contentTypeHeader?.contains("charset=") == true) {
+                                                    contentTypeHeader.split("charset=").getOrNull(1)?.split(";")?.getOrNull(0)?.trim() ?: "utf-8"
+                                                } else {
+                                                    "utf-8"
+                                                }
+                                                
+                                                val responseHeaders = mutableMapOf<String, String>()
+                                                for (name in response.headers.names()) {
+                                                    responseHeaders[name] = response.header(name) ?: ""
+                                                }
+                                                
+                                                return WebResourceResponse(
+                                                    mimeType,
+                                                    encoding,
+                                                    response.code,
+                                                    response.message.ifEmpty { "OK" },
+                                                    responseHeaders,
+                                                    responseBody.byteStream()
+                                                )
+                                            }
+                                        } catch (e: Exception) {
+                                            // Fallback silently if any exception occurs, letting the WebView fetch normally
+                                        }
+                                    }
+                                    return super.shouldInterceptRequest(view, request)
                                 }
                             }
 
@@ -411,9 +469,19 @@ fun MainScreen(
                             }
 
                             loadUrl("https://hydraulic-hamzeh.ir")
-                            webViewInstance = this
-                            onWebViewCreated(this)
                         }
+
+                        webViewRef = webView
+                        swipeRefreshLayout.addView(webView)
+
+                        swipeRefreshLayout.setOnRefreshListener {
+                            webView.reload()
+                        }
+
+                        webViewInstance = webView
+                        onWebViewCreated(webView)
+
+                        swipeRefreshLayout
                     },
                     modifier = Modifier.fillMaxSize()
                 )
@@ -664,4 +732,57 @@ private fun checkInitialNetwork(context: Context): Boolean {
     val activeNetwork = cm.activeNetwork ?: return false
     val capabilities = cm.getNetworkCapabilities(activeNetwork) ?: return false
     return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+}
+
+// Custom Cache Manager for WebView's static resources using OkHttp with aggressive Cache-Control overriding
+object WebViewCacheManager {
+    private var okHttpClientInstance: okhttp3.OkHttpClient? = null
+
+    fun getOkHttpClient(context: Context): okhttp3.OkHttpClient {
+        return okHttpClientInstance ?: synchronized(this) {
+            okHttpClientInstance ?: run {
+                val cacheDir = java.io.File(context.cacheDir, "okhttp-static-cache")
+                if (!cacheDir.exists()) {
+                    cacheDir.mkdirs()
+                }
+                val cacheSize = 100 * 1024 * 1024L // 100 MiB cache
+                val cache = okhttp3.Cache(cacheDir, cacheSize)
+                
+                okhttp3.OkHttpClient.Builder()
+                    .cache(cache)
+                    .addNetworkInterceptor { chain ->
+                        val response = chain.proceed(chain.request())
+                        val url = chain.request().url.toString()
+                        if (isStaticAsset(url)) {
+                            // Intercept network response and rewrite response headers to force-cache static files for 30 days
+                            response.newBuilder()
+                                .header("Cache-Control", "public, max-age=2592000") // 30 days
+                                .header("Pragma", "public")
+                                .removeHeader("Expires")
+                                .build()
+                        } else {
+                            response
+                        }
+                    }
+                    .build().also { okHttpClientInstance = it }
+            }
+        }
+    }
+
+    fun isStaticAsset(url: String): Boolean {
+        val cleanUrl = url.lowercase().split("?")[0].split("#")[0]
+        return cleanUrl.endsWith(".css") ||
+               cleanUrl.endsWith(".js") ||
+               cleanUrl.endsWith(".png") ||
+               cleanUrl.endsWith(".jpg") ||
+               cleanUrl.endsWith(".jpeg") ||
+               cleanUrl.endsWith(".gif") ||
+               cleanUrl.endsWith(".webp") ||
+               cleanUrl.endsWith(".svg") ||
+               cleanUrl.endsWith(".ico") ||
+               cleanUrl.endsWith(".woff") ||
+               cleanUrl.endsWith(".woff2") ||
+               cleanUrl.endsWith(".ttf") ||
+               cleanUrl.endsWith(".otf")
+    }
 }
